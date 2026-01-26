@@ -170,6 +170,22 @@ typedef bool (*Comparison)(const Block*, const Block*);
 static bool BlockComparatorSize(const Block* a, const Block* b);
 static bool BlockComparatorAddress(const Block* a, const Block* b);
 
+/**
+ * @csc [NOTE]
+ * BlockPool 存储的都是空闲的 Block ，不管理活跃的 Block
+ * 
+ * 活跃的 Block 会同时放在两个地方：
+ *    - NativeCachingAllocator 的 allocated_blocks 中：存储所有活跃的 Block
+ *    - DeviceCachingAllocator 的 active_blocks 中：存储对应 device 上的活跃 Block
+ * 
+ * 每一个 device 上有两个 BlockPool ：
+ *    - small BlockPool ： 管理 size 较小的 Block
+ *    - large BlockPool ： 管理 size 较大的 Block
+ * 具体的阈值可见 DeviceCachingAllocator::get_pool()
+ * 
+ * 一个 BlockPool 存储的 Block 都是同一个 device 上分配的
+ * 但是这些 Block 可以被不同的 stream 使用
+ */
 struct BlockPool {
   BlockPool(bool small, PrivatePool* private_pool = nullptr)
       : blocks(BlockComparatorSize),
@@ -830,6 +846,10 @@ static bool BlockComparatorAddress(const Block* a, const Block* b) {
   return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
 }
 
+/**
+ * @csc [NOTE]
+ * AllocParams 用于封装内存分配请求所需要的信息以及最终获取到的 Block
+ */
 struct AllocParams {
   AllocParams(
       c10::DeviceIndex device,
@@ -849,9 +869,13 @@ struct AllocParams {
     return search_key.size;
   }
 
+  // @csc 
+  // search_key 用于在 pool 中寻找合适大小的 Block
   Block search_key;
   BlockPool* pool;
   size_t alloc_size;
+  // @csc 
+  // block 用于存储分配得到的 Block
   Block* block{nullptr};
   StatTypes stat_types = {false};
   cudaError_t err{cudaSuccess};
@@ -1174,6 +1198,31 @@ class DeviceCachingAllocator {
   //     ends.
   ska::flat_hash_map<Block*, std::vector<cudaGraphNode_t>> deferred_blocks;
 
+  /**
+   * @csc [NOTE]
+   * 存放本 device 上等待 CUDA Event 完成的 Block
+   * 
+   * Block 在被释放时，并不会立即被释放回内存池
+   * 而是需要先在对应的 CUDA Stream 上插入一个 CUDA Event
+   * 等待该 Event 完成后，Block 才可以被真正释放回内存池
+   * 这是因为 CUDA kernel 是异步执行的，因此会出现这样的情况：
+   *    - host 调用 CUDA API 在某一个 CUDA Stream 上发射了 kernel
+   *    - CUDA API 立即返回，因此 host 会继续执行
+   *    - 但是此时 kernel 可能还没有执行完成，或者甚至还没有开始执行
+   *    - 如果这时 host 调用了 free() 去释放 kernel 使用的 Block：
+   *        - 如果直接把这块 Block 释放回 BlockPool ，那么后续有可能会被重新分配出去，被其他 CUDA Stream 上的 kernel 使用，这样就会有多个 kernel 同时使用这块 Block ，导致数据错误
+   *        - 因此这里必须等待 kernel 执行完成后，才能把 Block 释放回 BlockPool
+   * 所以这里就需要在 Stream 中插入一个 Event （见 DeviceCachingAllocator::free() 中调用 DeviceCachingAllocator::insert_events() ）
+   * 这个 Event 完成了，就意味着前面的 kernel 都执行完毕了
+   * 此时才可以安全的把 Block 释放回 BlockPool
+   * 具体来说，会在需要分配 Block 的时候，去检查 Event 的完成情况，将完成 Event 的 Block 释放回 BlockPool （见 DeviceCachingAllocator::malloc() 中调用 DeviceCachingAllocator::process_events() ）
+   * 
+   * 将在同一个 CUDA Stream 上等待 CUDA Event 完成的 Block 以 (CUDA Event, Block) 对的形式放在一个双向队列中
+   * 先入队列的 Event 是更早插入该 Stream 的
+   * 那么它肯定会比后入队列的 Event 更早完成
+   * 因此处理时，只需要从队列头部开始往后检查，如果检查到有 Event 还没有完成，那么后面的所有 Event 都不可能完成
+   * （见 DeviceCachingAllocator::process_events() ）
+   */
   // outstanding cuda events
   ska::flat_hash_map<
       cuda::CUDAStream,
@@ -1312,6 +1361,17 @@ class DeviceCachingAllocator {
   // All public methods (except the above) acquire the allocator mutex.
   // Thus, do not call a public method from another public method.
 
+  /**
+   * @csc [NOTE]
+   * 1. 先去查看 device 上的所有还没完成的 CUDA Event 以及对应的 Block，依次去检查是否完成，如果完成就将 Block 从活跃集合移动到 BlockPool 中
+   * 2. 根据用户请求的分配的显存大小找到对应的 BlockPool （是 small 还是 large ）
+   * 3. 尝试去 BlockPool 中寻找大小最合适的 Block ，如果找到，将其移除出 BlockPool 并跳转到第 6 步
+   * 4. 如果没找到，再尝试去调用 CUDA API 分配一块新的内存，如果分配成功，把这块内存作为找到的 Block 并跳转到第 6 步
+   * 5. 如果调用 CUDA API 分配失败就报错 OOM
+   * 6. 尝试将找到的 Block 进行 split 成两个 Block ：
+   *      - 前面的 Block 作为本次分配的结果返回
+   *      - 后面的（如果有的话） Block 插回 BlockPool
+   */
   Block* malloc(
       c10::DeviceIndex device,
       size_t orig_size,
@@ -1530,6 +1590,12 @@ class DeviceCachingAllocator {
         params, orig_size, std::move(context), split_remainder);
   }
 
+  /**
+   * @csc [NOTE]
+   * 如果需要的话，把找到的 Block 进行 split
+   * 把目标 Block 插入 active_blocks
+   * 把 split 出来的剩余 Block (如果有的话)放回 pool
+   */
   Block* alloc_found_block(
       const AllocParams& params,
       size_t orig_size,
@@ -1871,6 +1937,12 @@ class DeviceCachingAllocator {
     }
   }
 
+  /**
+   * @csc [NOTE]
+   * 查看是否还有 CUDA Stream 在使用 Block：
+   *    - 如果有：在这些 Stream 上插入 CUDA Event，此时 Block 仍旧在活跃 Block 集合（即 active_blocks ）中
+   *    - 如果没有：将 Block 从活跃 Block 集合中移除，并释放回 BlockPool
+   */
   void free(Block* block) {
     std::shared_ptr<GatheredContext> context =
         maybeGatherContext(RecordContext::ALL);
@@ -2789,6 +2861,11 @@ class DeviceCachingAllocator {
     return candidate;
   }
 
+  /**
+   * @csc [NOTE]
+   * 把 Block 从活跃的 Block 集合中移除，将其放入 BlockPool 中
+   * 在移除和放入之前尝试对 Block 两边的两个 Block 进行 merge
+   */
   /** moves a block into a pool of cached free blocks */
   void free_block(
       Block* block,
@@ -2954,6 +3031,11 @@ class DeviceCachingAllocator {
     }
   }
 
+  /**
+   * @csc [NOTE]
+   * 从对应的 BlockPool 中查找大小最合适的那个 Block （就是大小大于等于请求的大小的 Block 中，最小的那个）
+   * 然后把找到的这个 Block 从 BlockPool 中移除返回
+   */
   bool get_free_block(AllocParams& p) {
     BlockPool& pool = *p.pool;
 
@@ -3526,6 +3608,12 @@ class DeviceCachingAllocator {
     }
   }
 
+  /**
+   * @csc [NOTE]
+   * 在使用 Block 的每个 Stream 上插入一个 CUDA Event
+   * 并将 Stream ， Event 和 Block 信息存储到 cuda_events 中
+   * （具体原因见 DeviceCachingAllocator::cuda_events 注释）
+   */
   void insert_events(Block* block) {
     c10::DeviceIndex prev_device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&prev_device));
@@ -3564,6 +3652,10 @@ class DeviceCachingAllocator {
     }
   }
 
+  /**
+   * @csc [NOTE]
+   * 查询本 device 的所有 outstanding CUDA Event 是否都完成
+   */
   void process_events(const std::shared_ptr<GatheredContext>& context) {
     insert_events_deferred_until_no_capture(context);
 
